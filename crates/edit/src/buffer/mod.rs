@@ -66,6 +66,13 @@ pub struct TextBufferStatistics {
     visual_lines: CoordType,
 }
 
+/// Specifies how to interpret the current selection.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SelectionMode {
+    Linear,
+    Rectangular,
+}
+
 /// Stores the active text selection anchors.
 ///
 /// The two points are not sorted. Instead, `beg` refers to where the selection
@@ -74,6 +81,7 @@ pub struct TextBufferStatistics {
 struct TextBufferSelection {
     beg: Point,
     end: Point,
+    mode: SelectionMode,
 }
 
 /// In order to group actions into a single undo step,
@@ -1024,6 +1032,22 @@ impl TextBuffer {
         ));
     }
 
+    /// Moves the cursor to `visual_pos` and updates a rectangular selection to contain it.
+    pub fn selection_update_visual_rectangular(&mut self, visual_pos: Point) {
+        self.start_rectangular_selection();
+        self.set_cursor_for_selection(self.cursor_move_to_visual_internal(self.cursor, visual_pos));
+    }
+
+    /// Moves the cursor by `delta` and updates a rectangular selection to contain it.
+    pub fn selection_update_delta_rectangular(&mut self, granularity: CursorMovement, delta: CoordType) {
+        self.start_rectangular_selection();
+        self.set_cursor_for_selection(self.cursor_move_delta_internal(
+            self.cursor,
+            granularity,
+            delta,
+        ));
+    }
+
     /// Select the current word.
     pub fn select_word(&mut self) {
         let Range { start, end } = navigation::word_select(&self.buffer, self.cursor.offset);
@@ -1033,6 +1057,7 @@ impl TextBuffer {
         self.set_selection(Some(TextBufferSelection {
             beg: beg.logical_pos,
             end: end.logical_pos,
+            mode: SelectionMode::Linear,
         }));
     }
 
@@ -1048,6 +1073,7 @@ impl TextBuffer {
         self.set_selection(Some(TextBufferSelection {
             beg: beg.logical_pos,
             end: end.logical_pos,
+            mode: SelectionMode::Linear,
         }));
     }
 
@@ -1059,6 +1085,7 @@ impl TextBuffer {
         self.set_selection(Some(TextBufferSelection {
             beg: beg.logical_pos,
             end: end.logical_pos,
+            mode: SelectionMode::Linear,
         }));
     }
 
@@ -1068,7 +1095,25 @@ impl TextBuffer {
             self.set_selection(Some(TextBufferSelection {
                 beg: self.cursor.logical_pos,
                 end: self.cursor.logical_pos,
+                mode: SelectionMode::Linear,
             }));
+        }
+    }
+
+    /// Starts or converts to a rectangular selection.
+    pub fn start_rectangular_selection(&mut self) {
+        match self.selection {
+            Some(mut selection) => {
+                selection.mode = SelectionMode::Rectangular;
+                self.set_selection(Some(selection));
+            }
+            None => {
+                self.set_selection(Some(TextBufferSelection {
+                    beg: self.cursor.logical_pos,
+                    end: self.cursor.logical_pos,
+                    mode: SelectionMode::Rectangular,
+                }));
+            }
         }
     }
 
@@ -1118,7 +1163,7 @@ impl TextBuffer {
         // If the user moved the cursor since the last search, but the needle remained the same,
         // we still need to move the start of the search to the new cursor position.
         let next_search_offset = match self.selection {
-            Some(TextBufferSelection { beg, end }) => {
+            Some(TextBufferSelection { beg, end, .. }) => {
                 if self.selection_generation == search.selection_generation {
                     search.next_search_offset
                 } else {
@@ -1275,6 +1320,7 @@ impl TextBuffer {
             self.set_selection(Some(TextBufferSelection {
                 beg: beg.logical_pos,
                 end: end.logical_pos,
+                mode: SelectionMode::Linear,
             }))
         } else {
             // Avoid searching through the entire document again if we know there's nothing to find.
@@ -1674,16 +1720,20 @@ impl TextBuffer {
     }
 
     fn set_cursor_for_selection(&mut self, cursor: Cursor) {
-        let beg = match self.selection {
-            Some(TextBufferSelection { beg, .. }) => beg,
-            None => self.cursor.logical_pos,
+        let (beg, mode) = match self.selection {
+            Some(TextBufferSelection { beg, mode, .. }) => (beg, mode),
+            None => (self.cursor.logical_pos, SelectionMode::Linear),
         };
 
         self.set_cursor_internal(cursor);
         self.last_history_type = HistoryType::Other;
 
         let end = self.cursor.logical_pos;
-        self.set_selection(if beg == end { None } else { Some(TextBufferSelection { beg, end }) });
+        self.set_selection(if beg == end {
+            None
+        } else {
+            Some(TextBufferSelection { beg, end, mode })
+        });
     }
 
     fn set_cursor_internal(&mut self, cursor: Cursor) {
@@ -1732,10 +1782,30 @@ impl TextBuffer {
             if da < db { a } else { b }
         };
 
-        let [selection_beg, selection_end] = match self.selection {
-            None => [Point::MIN, Point::MIN],
-            Some(TextBufferSelection { beg, end }) => minmax(beg, end),
-        };
+        let (selection_beg, selection_end, selection_mode, selection_visual_beg, selection_visual_end) =
+            match self.selection {
+                None => (
+                    Point::MIN,
+                    Point::MIN,
+                    SelectionMode::Linear,
+                    Point::MIN,
+                    Point::MIN,
+                ),
+                Some(TextBufferSelection { beg, end, mode }) => {
+                    let [selection_beg, selection_end] = minmax(beg, end);
+                    let selection_beg_cursor =
+                        self.cursor_move_to_logical_internal(self.cursor, beg);
+                    let selection_end_cursor =
+                        self.cursor_move_to_logical_internal(selection_beg_cursor, end);
+                    (
+                        selection_beg,
+                        selection_end,
+                        mode,
+                        selection_beg_cursor.visual_pos,
+                        selection_end_cursor.visual_pos,
+                    )
+                }
+            };
 
         line.reserve(width as usize * 2);
 
@@ -1794,57 +1864,94 @@ impl TextBuffer {
 
             let mut selection_off = 0..0;
 
-            // Figure out the selection range on this line, if any.
-            if cursor_beg.visual_pos.y == visual_line
-                && selection_beg <= cursor_end.logical_pos
-                && selection_end >= cursor_beg.logical_pos
-            {
-                let mut cursor = cursor_beg;
+            match selection_mode {
+                SelectionMode::Rectangular => {
+                    let selection_y_min = selection_visual_beg.y.min(selection_visual_end.y);
+                    let selection_y_max = selection_visual_beg.y.max(selection_visual_end.y);
 
-                // By default, we assume the entire line is selected.
-                let mut selection_pos_beg = 0;
-                let mut selection_pos_end = COORD_TYPE_SAFE_MAX;
-                selection_off.start = cursor_beg.offset;
-                selection_off.end = cursor_end.offset;
+                    if (selection_y_min..=selection_y_max).contains(&visual_line) {
+                        let selection_pos_beg =
+                            selection_visual_beg.x.min(selection_visual_end.x);
+                        let selection_pos_end =
+                            selection_visual_beg.x.max(selection_visual_end.x);
+                        let left = destination.left + self.margin_width - origin.x;
+                        let top = destination.top + y;
+                        let rect = Rect {
+                            left: left + selection_pos_beg.max(origin.x),
+                            top,
+                            right: left + selection_pos_end.min(origin.x + text_width),
+                            bottom: top + 1,
+                        };
 
-                // The start of the selection is within this line. We need to update selection_beg.
-                if selection_beg <= cursor_end.logical_pos
-                    && selection_beg >= cursor_beg.logical_pos
-                {
-                    cursor = self.cursor_move_to_logical_internal(cursor, selection_beg);
-                    selection_off.start = cursor.offset;
-                    selection_pos_beg = cursor.visual_pos.x;
+                        let mut bg =
+                            fb.indexed(IndexedColor::Foreground).oklab_blend(fb.indexed_alpha(
+                                IndexedColor::BrightBlue,
+                                1,
+                                2,
+                            ));
+                        if !focused {
+                            bg = bg.oklab_blend(fb.indexed_alpha(IndexedColor::Background, 1, 2));
+                        };
+                        let fg = fb.contrasted(bg);
+                        fb.blend_bg(rect, bg);
+                        fb.blend_fg(rect, fg);
+                    }
                 }
+                SelectionMode::Linear => {
+                    // Figure out the selection range on this line, if any.
+                    if cursor_beg.visual_pos.y == visual_line
+                        && selection_beg <= cursor_end.logical_pos
+                        && selection_end >= cursor_beg.logical_pos
+                    {
+                        let mut cursor = cursor_beg;
 
-                // The end of the selection is within this line. We need to update selection_end.
-                if selection_end <= cursor_end.logical_pos
-                    && selection_end >= cursor_beg.logical_pos
-                {
-                    cursor = self.cursor_move_to_logical_internal(cursor, selection_end);
-                    selection_off.end = cursor.offset;
-                    selection_pos_end = cursor.visual_pos.x;
+                        // By default, we assume the entire line is selected.
+                        let mut selection_pos_beg = 0;
+                        let mut selection_pos_end = COORD_TYPE_SAFE_MAX;
+                        selection_off.start = cursor_beg.offset;
+                        selection_off.end = cursor_end.offset;
+
+                        // The start of the selection is within this line. We need to update selection_beg.
+                        if selection_beg <= cursor_end.logical_pos
+                            && selection_beg >= cursor_beg.logical_pos
+                        {
+                            cursor = self.cursor_move_to_logical_internal(cursor, selection_beg);
+                            selection_off.start = cursor.offset;
+                            selection_pos_beg = cursor.visual_pos.x;
+                        }
+
+                        // The end of the selection is within this line. We need to update selection_end.
+                        if selection_end <= cursor_end.logical_pos
+                            && selection_end >= cursor_beg.logical_pos
+                        {
+                            cursor = self.cursor_move_to_logical_internal(cursor, selection_end);
+                            selection_off.end = cursor.offset;
+                            selection_pos_end = cursor.visual_pos.x;
+                        }
+
+                        let left = destination.left + self.margin_width - origin.x;
+                        let top = destination.top + y;
+                        let rect = Rect {
+                            left: left + selection_pos_beg.max(origin.x),
+                            top,
+                            right: left + selection_pos_end.min(origin.x + text_width),
+                            bottom: top + 1,
+                        };
+
+                        let mut bg =
+                            fb.indexed(IndexedColor::Foreground).oklab_blend(fb.indexed_alpha(
+                                IndexedColor::BrightBlue,
+                                1,
+                                2,
+                            ));
+                        if !focused {
+                            bg = bg.oklab_blend(fb.indexed_alpha(IndexedColor::Background, 1, 2));
+                        };
+                        let fg = fb.contrasted(bg);
+                        fb.blend_bg(rect, bg);
+                        fb.blend_fg(rect, fg);
+                    }
                 }
-
-                let left = destination.left + self.margin_width - origin.x;
-                let top = destination.top + y;
-                let rect = Rect {
-                    left: left + selection_pos_beg.max(origin.x),
-                    top,
-                    right: left + selection_pos_end.min(origin.x + text_width),
-                    bottom: top + 1,
-                };
-
-                let mut bg = fb.indexed(IndexedColor::Foreground).oklab_blend(fb.indexed_alpha(
-                    IndexedColor::BrightBlue,
-                    1,
-                    2,
-                ));
-                if !focused {
-                    bg = bg.oklab_blend(fb.indexed_alpha(IndexedColor::Background, 1, 2));
-                };
-                let fg = fb.contrasted(bg);
-                fb.blend_bg(rect, bg);
-                fb.blend_fg(rect, fg);
             }
 
             // Nothing to do if the entire line is empty.
@@ -2291,7 +2398,7 @@ impl TextBuffer {
         let mut selection_beg = self.cursor.logical_pos;
         let mut selection_end = selection_beg;
 
-        if let Some(TextBufferSelection { beg, end }) = &selection {
+        if let Some(TextBufferSelection { beg, end, .. }) = &selection {
             selection_beg = *beg;
             selection_end = *end;
         }
@@ -2348,9 +2455,11 @@ impl TextBuffer {
 
         // NOTE: If the selection was previously `None`,
         // it should continue to be `None` after this.
-        self.set_selection(
-            selection.map(|_| TextBufferSelection { beg: selection_beg, end: selection_end }),
-        );
+        self.set_selection(selection.map(|selection| TextBufferSelection {
+            beg: selection_beg,
+            end: selection_end,
+            mode: selection.mode,
+        }));
     }
 
     fn measure_indent_internal(
@@ -2464,6 +2573,54 @@ impl TextBuffer {
     /// May optionally delete it, if requested. This is meant to be used for Ctrl+X.
     fn extract_selection(&mut self, delete: bool) -> Vec<u8> {
         let line_copy = !self.has_selection();
+        if let Some(selection) = self.selection {
+            if selection.mode == SelectionMode::Rectangular {
+                let beg_cursor = self.cursor_move_to_logical_internal(self.cursor, selection.beg);
+                let end_cursor = self.cursor_move_to_logical_internal(beg_cursor, selection.end);
+                let min_y = beg_cursor.visual_pos.y.min(end_cursor.visual_pos.y);
+                let max_y = beg_cursor.visual_pos.y.max(end_cursor.visual_pos.y);
+                let min_x = beg_cursor.visual_pos.x.min(end_cursor.visual_pos.x);
+                let max_x = beg_cursor.visual_pos.x.max(end_cursor.visual_pos.x);
+                let mut out = Vec::new();
+                let mut ranges = Vec::new();
+
+                for y in min_y..=max_y {
+                    let line_start =
+                        self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
+                    let range_beg = self.cursor_move_to_visual_internal(
+                        line_start,
+                        Point { x: min_x, y },
+                    );
+                    let range_end = self.cursor_move_to_visual_internal(
+                        range_beg,
+                        Point { x: max_x, y },
+                    );
+
+                    if range_beg.offset < range_end.offset {
+                        self.buffer
+                            .extract_raw(range_beg.offset..range_end.offset, &mut out, 0);
+                        ranges.push((range_beg, range_end));
+                    }
+
+                    if y != max_y {
+                        out.extend_from_slice(if self.newlines_are_crlf { b"\r\n" } else { b"\n" });
+                    }
+                }
+
+                if delete && !out.is_empty() {
+                    self.edit_begin_grouping();
+                    for (beg, end) in ranges.into_iter().rev() {
+                        self.edit_begin(HistoryType::Delete, beg);
+                        self.edit_delete(end);
+                        self.edit_end();
+                    }
+                    self.edit_end_grouping();
+                    self.set_selection(None);
+                }
+
+                return out;
+            }
+        }
         let Some((beg, end)) = self.selection_range_internal(true) else {
             return Vec::new();
         };
@@ -2522,7 +2679,7 @@ impl TextBuffer {
                 Point { x: 0, y: self.cursor.logical_pos.y },
                 Point { x: 0, y: self.cursor.logical_pos.y + 1 },
             ],
-            Some(TextBufferSelection { beg, end }) => minmax(beg, end),
+            Some(TextBufferSelection { beg, end, .. }) => minmax(beg, end),
         };
 
         let beg = self.cursor_move_to_logical_internal(self.cursor, beg);
