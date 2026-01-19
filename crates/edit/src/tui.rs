@@ -2510,7 +2510,9 @@ impl<'a> Context<'a, '_> {
                     } else {
                         CursorMovement::Grapheme
                     };
-                    if modifiers.contains(kbmod::SHIFT) {
+                    if modifiers == kbmod::ALT_SHIFT {
+                        tb.selection_update_delta_rectangular(granularity, -1);
+                    } else if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, -1);
                     } else if let Some((beg, _)) = tb.selection_range() {
                         unsafe { tb.set_cursor(beg) };
@@ -2559,6 +2561,16 @@ impl<'a> Context<'a, '_> {
                                 y: tb.cursor_visual_pos().y - 1,
                             });
                         }
+                        kbmod::ALT_SHIFT => {
+                            if tb.cursor_visual_pos().y == 0 {
+                                tc.preferred_column = 0;
+                            }
+
+                            tb.selection_update_visual_rectangular(Point {
+                                x: tc.preferred_column,
+                                y: tb.cursor_visual_pos().y - 1,
+                            });
+                        }
                         kbmod::ALT => tb.move_selected_lines(MoveLineDirection::Up),
                         kbmod::CTRL_ALT => {
                             // TODO: Add cursor above
@@ -2572,7 +2584,9 @@ impl<'a> Context<'a, '_> {
                     } else {
                         CursorMovement::Grapheme
                     };
-                    if modifiers.contains(kbmod::SHIFT) {
+                    if modifiers == kbmod::ALT_SHIFT {
+                        tb.selection_update_delta_rectangular(granularity, 1);
+                    } else if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, 1);
                     } else if let Some((_, end)) = tb.selection_range() {
                         unsafe { tb.set_cursor(end) };
@@ -2622,6 +2636,20 @@ impl<'a> Context<'a, '_> {
                             }
 
                             tb.selection_update_visual(Point {
+                                x: tc.preferred_column,
+                                y: tb.cursor_visual_pos().y + 1,
+                            });
+
+                            if tc.preferred_column == CoordType::MAX {
+                                tc.preferred_column = tb.cursor_visual_pos().x;
+                            }
+                        }
+                        kbmod::ALT_SHIFT => {
+                            if tb.cursor_visual_pos().y >= tb.visual_line_count() - 1 {
+                                tc.preferred_column = CoordType::MAX;
+                            }
+
+                            tb.selection_update_visual_rectangular(Point {
                                 x: tc.preferred_column,
                                 y: tb.cursor_visual_pos().y + 1,
                             });
