@@ -2599,7 +2599,7 @@ impl TextBuffer {
                     if range_beg.offset < range_end.offset {
                         let out_off = out.len();
                         self.buffer
-                            .extract_raw(range_beg.offset..range_end.offset, &mut out, out_off);
+                            .extract_raw(range_beg.offset..range_end.offset, &mut out, out.len());
                         ranges.push((range_beg, range_end));
                     }
 
