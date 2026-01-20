@@ -2598,7 +2598,7 @@ impl TextBuffer {
 
                     if range_beg.offset < range_end.offset {
                         self.buffer
-                            .extract_raw(range_beg.offset..range_end.offset, &mut out, 0);
+                            .extract_raw(range_beg.offset..range_end.offset, &mut out, out.len());
                         ranges.push((range_beg, range_end));
                     }
 
