@@ -2577,8 +2577,8 @@ impl TextBuffer {
             if selection.mode == SelectionMode::Rectangular {
                 let beg_cursor = self.cursor_move_to_logical_internal(self.cursor, selection.beg);
                 let end_cursor = self.cursor_move_to_logical_internal(beg_cursor, selection.end);
-                let min_y = beg_cursor.logical_pos.y.min(end_cursor.logical_pos.y);
-                let max_y = beg_cursor.logical_pos.y.max(end_cursor.logical_pos.y);
+                let min_y = beg_cursor.visual_pos.y.min(end_cursor.visual_pos.y);
+                let max_y = beg_cursor.visual_pos.y.max(end_cursor.visual_pos.y);
                 let min_x = beg_cursor.visual_pos.x.min(end_cursor.visual_pos.x);
                 let max_x = beg_cursor.visual_pos.x.max(end_cursor.visual_pos.x);
                 let mut out = Vec::new();
@@ -2586,56 +2586,19 @@ impl TextBuffer {
 
                 for y in min_y..=max_y {
                     let line_start =
-                        self.cursor_move_to_logical_internal(self.cursor, Point { x: 0, y });
-                    let line_end = self.cursor_move_to_logical_internal(
+                        self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
+                    let range_beg = self.cursor_move_to_visual_internal(
                         line_start,
-                        Point { x: CoordType::MAX, y },
+                        Point { x: min_x, y },
                     );
-                    let line_visual_y = line_start.visual_pos.y;
-
-                    let range_beg = if min_x >= line_end.visual_pos.x {
-                        line_end
-                    } else {
-                        self.cursor_move_to_visual_internal(
-                            line_start,
-                            Point {
-                                x: min_x,
-                                y: line_visual_y,
-                            },
-                        )
-                    };
-                    let range_end = if max_x >= line_end.visual_pos.x {
-                        line_end
-                    } else {
-                        self.cursor_move_to_visual_internal(
-                            range_beg,
-                            Point {
-                                x: max_x,
-                                y: line_visual_y,
-                            },
-                        )
-                    };
+                    let range_end = self.cursor_move_to_visual_internal(
+                        range_beg,
+                        Point { x: max_x, y },
+                    );
 
                     if range_beg.offset < range_end.offset {
                         self.buffer
                             .extract_raw(range_beg.offset..range_end.offset, &mut out, 0);
-                    }
-
-                    let full_line_selected = min_x <= 0 && max_x >= line_end.visual_pos.x;
-                    if delete && full_line_selected {
-                        let delete_end = if y < self.stats.logical_lines {
-                            self.cursor_move_to_logical_internal(
-                                line_end,
-                                Point { x: 0, y: y + 1 },
-                            )
-                        } else {
-                            line_end
-                        };
-
-                        if range_beg.offset < delete_end.offset {
-                            ranges.push((range_beg, delete_end));
-                        }
-                    } else if range_beg.offset < range_end.offset {
                         ranges.push((range_beg, range_end));
                     }
 
@@ -2644,7 +2607,7 @@ impl TextBuffer {
                     }
                 }
 
-                if delete && (!ranges.is_empty() || !out.is_empty()) {
+                if delete && !out.is_empty() {
                     self.edit_begin_grouping();
                     for (beg, end) in ranges.into_iter().rev() {
                         self.edit_begin(HistoryType::Delete, beg);
