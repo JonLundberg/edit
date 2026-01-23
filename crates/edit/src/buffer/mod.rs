@@ -2577,33 +2577,35 @@ impl TextBuffer {
             if selection.mode == SelectionMode::Rectangular {
                 let beg_cursor = self.cursor_move_to_logical_internal(self.cursor, selection.beg);
                 let end_cursor = self.cursor_move_to_logical_internal(beg_cursor, selection.end);
+
                 let min_y = beg_cursor.visual_pos.y.min(end_cursor.visual_pos.y);
                 let max_y = beg_cursor.visual_pos.y.max(end_cursor.visual_pos.y);
                 let min_x = beg_cursor.visual_pos.x.min(end_cursor.visual_pos.x);
                 let max_x = beg_cursor.visual_pos.x.max(end_cursor.visual_pos.x);
-                let mut out = Vec::new();
+
+                let mut out   = Vec::new();
                 let mut ranges = Vec::new();
 
                 for y in min_y..=max_y {
-                    let line_start =
-                        self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
-                    let range_beg = self.cursor_move_to_visual_internal(
-                        line_start,
-                        Point { x: min_x, y },
-                    );
-                    let range_end = self.cursor_move_to_visual_internal(
-                        range_beg,
-                        Point { x: max_x, y },
-                    );
+                    let line_start = self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
+                    let range_beg  = self.cursor_move_to_visual_internal(line_start,
+                                                                        Point { x: min_x, y });
+                    let range_end  = self.cursor_move_to_visual_internal(range_beg,
+                                                                        Point { x: max_x, y });
 
                     if range_beg.offset < range_end.offset {
+                        // Save current length before mutably borrowing `out`.
                         let out_off = out.len();
-                        self.buffer
-                            .extract_raw(range_beg.offset..range_end.offset, &mut out, out.len());
+                        self.buffer.extract_raw(
+                            range_beg.offset..range_end.offset,
+                            &mut out,
+                            out_off,
+                        );
                         ranges.push((range_beg, range_end));
                     }
 
                     if y != max_y {
+                        // Append the appropriate newline.
                         out.extend_from_slice(if self.newlines_are_crlf { b"\r\n" } else { b"\n" });
                     }
                 }
@@ -2785,33 +2787,61 @@ impl TextBuffer {
         self.stats.logical_lines += self.cursor.logical_pos.y - logical_y_before;
     }
 
-    /// Deletes the text between the current cursor position and `to`.
+        /// Deletes the text between the current cursor position and `to`.
     /// It records the change in the undo stack.
     fn edit_delete(&mut self, to: Cursor) {
         debug_assert!(to.offset >= self.active_edit_off);
 
+        // Remember the logical line number where the deletion starts.
         let logical_y_before = self.cursor.logical_pos.y;
         let off = self.active_edit_off;
         let mut out_off = usize::MAX;
 
-        let mut undo = self.undo_stack.back_mut().unwrap().borrow_mut();
+        // -----------------------------------------------------------------
+        // Work with the undo entry in its own scope so that the mutable
+        // borrow ends before we need to read from `self` again.
+        // -----------------------------------------------------------------
+        {
+            let mut undo = self.undo_stack.back_mut().unwrap().borrow_mut();
 
-        // If this is a continued backspace operation,
-        // we need to prepend the deleted portion to the undo entry.
-        if self.cursor.logical_pos < undo.cursor {
-            out_off = 0;
-            undo.cursor = self.cursor.logical_pos;
-        }
+            // If this is a continued backspace operation,
+            // we need to prepend the deleted portion to the undo entry.
+            if self.cursor.logical_pos < undo.cursor {
+                out_off = 0;
+                undo.cursor = self.cursor.logical_pos;
+            }
 
-        // Copy the deleted portion into the undo entry.
-        let deleted = &mut undo.deleted;
-        self.buffer.extract_raw(off..to.offset, deleted, out_off);
+            // Copy the deleted portion into the undo entry.
+            let deleted = &mut undo.deleted;
+            self.buffer.extract_raw(off..to.offset, deleted, out_off);
+        }   // `undo` (the mutable RefMut) is dropped here.
 
         // Delete the portion from the buffer by enlarging the gap.
         let count = to.offset - off;
         self.buffer.allocate_gap(off, 0, count);
 
-        self.stats.logical_lines += logical_y_before - to.logical_pos.y;
+        // -----------------------------------------------------------------
+        // Keep `stats.logical_lines` in sync with deletions.
+        //
+        // After removing bytes we may have removed one or more newline
+        // characters. The number of logical lines that disappeared is the
+        // difference between the line number *before* the deletion and the
+        // line number of the same byte offset *after* the buffer has been
+        // modified.
+        //
+        // `cursor_move_to_offset_internal` recomputes the cursor position
+        // using the current (post‑delete) buffer contents, so the logical
+        // Y it returns reflects the new line count at that offset.
+        // -----------------------------------------------------------------
+        let after_cursor = self.cursor_move_to_offset_internal(self.cursor, off);
+        let lines_removed = logical_y_before.saturating_sub(after_cursor.logical_pos.y);
+
+        if lines_removed != 0 {
+            // `CoordType` is signed; we use saturating_sub to avoid underflow
+            // in the (theoretically impossible) case of a buggy count.
+            self.stats.logical_lines =
+                self.stats.logical_lines.saturating_sub(lines_removed as CoordType);
+        }
     }
 
     /// Finalizes the current edit operation
