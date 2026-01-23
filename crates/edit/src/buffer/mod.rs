@@ -2344,27 +2344,114 @@ impl TextBuffer {
         self.edit_end();
     }
 
+    /* --------------------------------------------------------------------- */
+    /*                     NEW HELPER – rectangular delete                  */
+    /* --------------------------------------------------------------------- */
+
+    /// Deletes the text that belongs to the current **rectangular** selection.
+    ///
+    /// The algorithm is identical to the rectangular part of `extract_selection`,
+    /// except that we never copy anything – we simply delete each visual slice
+    /// (in reverse order, so offsets stay valid) and finally clear the selection.
+    fn delete_rectangular_selection(&mut self) {
+        // We know there *is* a selection and it is rectangular.
+        let TextBufferSelection { beg, end, .. } = self.selection.unwrap();
+
+        // Convert the logical anchors to visual positions – this is exactly what
+        // `extract_selection` does.
+        let beg_cursor = self.cursor_move_to_logical_internal(self.cursor, beg);
+        let end_cursor = self.cursor_move_to_logical_internal(beg_cursor, end);
+
+        let min_y = beg_cursor.visual_pos.y.min(end_cursor.visual_pos.y);
+        let max_y = beg_cursor.visual_pos.y.max(end_cursor.visual_pos.y);
+        let min_x = beg_cursor.visual_pos.x.min(end_cursor.visual_pos.x);
+        let max_x = beg_cursor.visual_pos.x.max(end_cursor.visual_pos.x);
+
+        // Collect the (beg,end) pairs for every visual line that belongs to the
+        // rectangle.  We store them first because we must delete **backwards**,
+        // otherwise earlier deletions would shift the offsets of later ones.
+        let mut ranges = Vec::new();
+
+        for y in min_y..=max_y {
+            // Start of the visual line (column 0)
+            let line_start   = self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
+            // Left edge of the rectangle on this line
+            let range_beg    = self.cursor_move_to_visual_internal(line_start,
+                                                                  Point { x: min_x, y });
+            // Right edge (exclusive)
+            let range_end    = self.cursor_move_to_visual_internal(range_beg,
+                                                                  Point { x: max_x, y });
+
+            if range_beg.offset < range_end.offset {
+                ranges.push((range_beg, range_end));
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Perform the actual deletion.
+        //
+        // We need an edit‑group so that a rectangular delete is *one*
+        // undoable step (the same behaviour as linear deletes).
+        // --------------------------------------------------------------
+        if ranges.is_empty() {
+            self.set_selection(None);
+            return;
+        }
+
+        self.edit_begin_grouping();
+
+        for (beg, end) in ranges.into_iter().rev() {          // ← delete backwards
+            self.edit_begin(HistoryType::Delete, beg);
+            self.edit_delete(end);
+            self.edit_end();
+        }
+
+        self.edit_end_grouping();
+
+        // Finally clear the selection – a rectangular delete always consumes it.
+        self.set_selection(None);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /*                     ORIGINAL DELETE (now extended)                    */
+    /* --------------------------------------------------------------------- */
+
     /// Deletes 1 grapheme cluster from the buffer.
-    /// `cursor_movements` is expected to be -1 for backspace and 1 for delete.
-    /// If there's a current selection, it will be deleted and `cursor_movements` ignored.
-    /// The selection is cleared after the call.
-    /// Deletes characters from the buffer based on a delta from the cursor.
+    ///
+    /// `granularity` is expected to be -1 for backspace and +1 for delete.
+    /// If there’s a current **selection**, it will be deleted – *including*
+    /// rectangular selections – and `cursor_movements` are ignored.
     pub fn delete(&mut self, granularity: CursorMovement, delta: CoordType) {
         if delta == 0 {
             return;
         }
 
+        // --------------------------------------------------------------
+        // 1️⃣  Rectangular selection ?
+        // --------------------------------------------------------------
+        if let Some(selection) = self.selection {
+            if selection.mode == SelectionMode::Rectangular {
+                // The rectangular case does not need `delta` or `granularity`
+                // – the whole rectangle is removed at once.
+                self.delete_rectangular_selection();
+                return;
+            }
+        }
+
+        // --------------------------------------------------------------
+        // 2️⃣  Linear selection (or no selection) – keep the old logic
+        // --------------------------------------------------------------
         let mut beg;
         let mut end;
 
         if let Some(r) = self.selection_range_internal(false) {
-            (beg, end) = r;
+            (beg, end) = r;               // linear selection → delete it
         } else {
+            // No selection: move the cursor by `delta`/`granularity`.
             if (delta < 0 && self.cursor.offset == 0)
                 || (delta > 0 && self.cursor.offset >= self.text_length())
             {
-                // Nothing to delete.
-                return;
+                return;                  // nothing to delete
             }
 
             beg = self.cursor;
@@ -2377,12 +2464,16 @@ impl TextBuffer {
             }
         }
 
+        // --------------------------------------------------------------
+        // 3️⃣  Perform the delete (linear case)
+        // --------------------------------------------------------------
         self.edit_begin(HistoryType::Delete, beg);
         self.edit_delete(end);
         self.edit_end();
 
         self.set_selection(None);
     }
+
 
     /// Returns the logical position of the first character on this line.
     /// Return `.x == 0` if there are no non-whitespace characters.
