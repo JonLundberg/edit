@@ -29,6 +29,45 @@ use std::collections::LinkedList;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
+// #region agent log
+#[allow(dead_code)]
+fn dbg_agent_log(
+    loc: &str,
+    msg: &str,
+    hyp: &str,
+    data: &[(&str, String)],
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let esc = |s: &str| -> String {
+        let a = str::replace(s, '\\', "\\\\");
+        str::replace(&a, "\"", "\\\"")
+    };
+    let pairs: Vec<String> = data
+        .iter()
+        .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
+        .collect();
+    let data_json = format!("{{{}}}", pairs.join(","));
+    let line = format!(
+        r#"{{"sessionId":"debug-session","location":"{}","message":"{}","hypothesisId":"{}","data":{},"timestamp":{}}}"#,
+        esc(loc),
+        esc(msg),
+        hyp,
+        data_json,
+        ts
+    );
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(r"c:\Users\jonlu\source\edit\.cursor\debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", line)
+        });
+}
+// #endregion
 use std::mem::{self, MaybeUninit};
 use std::ops::Range;
 use std::rc::Rc;
@@ -2406,6 +2445,17 @@ impl TextBuffer {
         //     Reset last_history_type so edit_begin won't merge consecutive
         //     Deletes into one entry (which would break undo).
         // -----------------------------------------------------------------
+        // #region agent log
+        dbg_agent_log(
+            "buffer::mod delete_rectangular_selection",
+            "rect delete path",
+            "H5",
+            &[
+                ("path", "rect_delete".to_string()),
+                ("ranges", ranges.len().to_string()),
+            ],
+        );
+        // #endregion
         for (beg, end) in ranges.into_iter().rev() {
             self.last_history_type = HistoryType::Other;
             self.edit_begin(HistoryType::Delete, beg);
@@ -2709,6 +2759,17 @@ impl TextBuffer {
                 }
 
                 if delete && !out.is_empty() {
+                    // #region agent log
+                    dbg_agent_log(
+                        "buffer::mod extract_selection",
+                        "rect cut path",
+                        "H1",
+                        &[
+                            ("path", "rect_cut".to_string()),
+                            ("ranges", ranges.len().to_string()),
+                        ],
+                    );
+                    // #endregion
                     self.edit_begin_grouping();
                     for (beg, end) in ranges.into_iter().rev() {
                         self.edit_begin(HistoryType::Delete, beg);
@@ -2813,10 +2874,21 @@ impl TextBuffer {
         let cursor_before = self.cursor;
         self.set_cursor_internal(cursor);
 
+        let last = match self.last_history_type {
+            HistoryType::Other => "Other",
+            HistoryType::Write => "Write",
+            HistoryType::Delete => "Delete",
+        };
+        let ty = match history_type {
+            HistoryType::Other => "Other",
+            HistoryType::Write => "Write",
+            HistoryType::Delete => "Delete",
+        };
+        let will_alloc = history_type != self.last_history_type
+            || !matches!(history_type, HistoryType::Write | HistoryType::Delete);
+
         // If both the last and this are a Write/Delete operation, we skip allocating a new undo history item.
-        if history_type != self.last_history_type
-            || !matches!(history_type, HistoryType::Write | HistoryType::Delete)
-        {
+        if will_alloc {
             self.redo_stack.clear();
             while self.undo_stack.len() > 1000 {
                 self.undo_stack.pop_front();
@@ -2843,6 +2915,20 @@ impl TextBuffer {
                 entry.generation_before = info.generation_before;
             }
         }
+
+        // #region agent log
+        dbg_agent_log(
+            "buffer::mod edit_begin",
+            "edit_begin",
+            "H2_H3",
+            &[
+                ("last", last.to_string()),
+                ("type", ty.to_string()),
+                ("will_alloc", will_alloc.to_string()),
+                ("undo_len", self.undo_stack.len().to_string()),
+            ],
+        );
+        // #endregion
 
         self.active_edit_off = cursor.offset;
 
@@ -2885,7 +2971,7 @@ impl TextBuffer {
         self.stats.logical_lines += self.cursor.logical_pos.y - logical_y_before;
     }
 
-        /// Deletes the text between the current cursor position and `to`.
+    /// Deletes the text between the current cursor position and `to`.
     /// It records the change in the undo stack.
     fn edit_delete(&mut self, to: Cursor) {
         debug_assert!(to.offset >= self.active_edit_off);
@@ -2899,12 +2985,14 @@ impl TextBuffer {
         // Work with the undo entry in its own scope so that the mutable
         // borrow ends before we need to read from `self` again.
         // -----------------------------------------------------------------
+        let prepend;
         {
             let mut undo = self.undo_stack.back_mut().unwrap().borrow_mut();
 
             // If this is a continued backspace operation,
             // we need to prepend the deleted portion to the undo entry.
-            if self.cursor.logical_pos < undo.cursor {
+            prepend = self.cursor.logical_pos < undo.cursor;
+            if prepend {
                 out_off = 0;
                 undo.cursor = self.cursor.logical_pos;
             }
@@ -2913,6 +3001,19 @@ impl TextBuffer {
             let deleted = &mut undo.deleted;
             self.buffer.extract_raw(off..to.offset, deleted, out_off);
         }   // `undo` (the mutable RefMut) is dropped here.
+
+        // #region agent log
+        let deleted_len = self.undo_stack.back().map(|e| e.borrow().deleted.len()).unwrap_or(0);
+        dbg_agent_log(
+            "buffer::mod edit_delete",
+            "edit_delete",
+            "H2",
+            &[
+                ("prepend", prepend.to_string()),
+                ("deleted_len", deleted_len.to_string()),
+            ],
+        );
+        // #endregion
 
         // Delete the portion from the buffer by enlarging the gap.
         let count = to.offset - off;
@@ -3053,6 +3154,20 @@ impl TextBuffer {
 
                 // Undo: Whatever was deleted is now added and vice versa.
                 mem::swap(&mut change.deleted, &mut change.added);
+
+                // #region agent log
+                dbg_agent_log(
+                    "buffer::mod undo_redo",
+                    "undo entry",
+                    "H4",
+                    &[
+                        ("cursor_y", cursor.logical_pos.y.to_string()),
+                        ("cursor_x", cursor.logical_pos.x.to_string()),
+                        ("reinsert_len", change.added.len().to_string()),
+                        ("remove_len", change.deleted.len().to_string()),
+                    ],
+                );
+                // #endregion
 
                 // Delete the inserted portion.
                 self.buffer.allocate_gap(cursor.offset, 0, change.deleted.len());
