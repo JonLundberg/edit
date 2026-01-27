@@ -2345,20 +2345,24 @@ impl TextBuffer {
     }
 
     /* --------------------------------------------------------------------- */
-    /*                     NEW HELPER – rectangular delete                  */
+    /*                     RECTANGULAR DELETE – option 1                    */
     /* --------------------------------------------------------------------- */
 
     /// Deletes the text that belongs to the current **rectangular** selection.
     ///
-    /// The algorithm is identical to the rectangular part of `extract_selection`,
-    /// except that we never copy anything – we simply delete each visual slice
-    /// (in reverse order, so offsets stay valid) and finally clear the selection.
+    /// For every visual line intersected by the rectangle we compute the start‑
+    /// and end‑cursor of the slice, then delete the slices *backwards* so that
+    /// earlier deletions do not shift the offsets of later ones.  Each slice is
+    /// recorded as a separate history entry (no `edit_begin_grouping()`), which
+    /// makes undo work correctly.
     fn delete_rectangular_selection(&mut self) {
-        // We know there *is* a selection and it is rectangular.
+        // -----------------------------------------------------------------
+        // 1️⃣  We know there *is* a selection and it is rectangular.
+        // -----------------------------------------------------------------
         let TextBufferSelection { beg, end, .. } = self.selection.unwrap();
 
-        // Convert the logical anchors to visual positions – this is exactly what
-        // `extract_selection` does.
+        // Convert the logical anchors to visual positions – exactly what
+        // `extract_selection` does for copy‑/cut‑rectangles.
         let beg_cursor = self.cursor_move_to_logical_internal(self.cursor, beg);
         let end_cursor = self.cursor_move_to_logical_internal(beg_cursor, end);
 
@@ -2367,48 +2371,48 @@ impl TextBuffer {
         let min_x = beg_cursor.visual_pos.x.min(end_cursor.visual_pos.x);
         let max_x = beg_cursor.visual_pos.x.max(end_cursor.visual_pos.x);
 
-        // Collect the (beg,end) pairs for every visual line that belongs to the
-        // rectangle.  We store them first because we must delete **backwards**,
-        // otherwise earlier deletions would shift the offsets of later ones.
-        let mut ranges = Vec::new();
+        // -----------------------------------------------------------------
+        // 2️⃣  Build a list of (beg,end) cursor pairs – one per visual line.
+        //     We collect them first because we must delete *backwards*.
+        // -----------------------------------------------------------------
+        let mut ranges: Vec<(Cursor, Cursor)> = Vec::new();
 
         for y in min_y..=max_y {
-            // Start of the visual line (column 0)
-            let line_start   = self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
-            // Left edge of the rectangle on this line
-            let range_beg    = self.cursor_move_to_visual_internal(line_start,
-                                                                  Point { x: min_x, y });
-            // Right edge (exclusive)
-            let range_end    = self.cursor_move_to_visual_internal(range_beg,
-                                                                  Point { x: max_x, y });
+            // column 0 of the current visual line
+            let line_start =
+                self.cursor_move_to_visual_internal(self.cursor, Point { x: 0, y });
+
+            // left edge of the rectangle on this line
+            let range_beg = self.cursor_move_to_visual_internal(
+                line_start,
+                Point { x: min_x, y },
+            );
+
+            // right (exclusive) edge of the rectangle on this line
+            let range_end = self.cursor_move_to_visual_internal(
+                range_beg,
+                Point { x: max_x, y },
+            );
 
             if range_beg.offset < range_end.offset {
                 ranges.push((range_beg, range_end));
             }
         }
 
-        // --------------------------------------------------------------
-        // Perform the actual deletion.
-        //
-        // We need an edit‑group so that a rectangular delete is *one*
-        // undoable step (the same behaviour as linear deletes).
-        // --------------------------------------------------------------
-        if ranges.is_empty() {
-            self.set_selection(None);
-            return;
-        }
-
-        self.edit_begin_grouping();
-
-        for (beg, end) in ranges.into_iter().rev() {          // ← delete backwards
+        // -----------------------------------------------------------------
+        // 3️⃣  Delete every slice.  **Do NOT** call edit_begin_grouping()**.
+        //     Each iteration creates its own HistoryEntry, so undo will
+        //     restore the slices in reverse order – exactly what we need.
+        // -----------------------------------------------------------------
+        for (beg, end) in ranges.into_iter().rev() {
             self.edit_begin(HistoryType::Delete, beg);
             self.edit_delete(end);
             self.edit_end();
         }
 
-        self.edit_end_grouping();
-
-        // Finally clear the selection – a rectangular delete always consumes it.
+        // -----------------------------------------------------------------
+        // 4️⃣  The rectangular selection is consumed – clear it.
+        // -----------------------------------------------------------------
         self.set_selection(None);
     }
 
