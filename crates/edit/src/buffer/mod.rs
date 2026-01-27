@@ -2403,8 +2403,11 @@ impl TextBuffer {
         // 3️⃣  Delete every slice.  **Do NOT** call edit_begin_grouping()**.
         //     Each iteration creates its own HistoryEntry, so undo will
         //     restore the slices in reverse order – exactly what we need.
+        //     Reset last_history_type so edit_begin won't merge consecutive
+        //     Deletes into one entry (which would break undo).
         // -----------------------------------------------------------------
         for (beg, end) in ranges.into_iter().rev() {
+            self.last_history_type = HistoryType::Other;
             self.edit_begin(HistoryType::Delete, beg);
             self.edit_delete(end);
             self.edit_end();
