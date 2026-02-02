@@ -2772,6 +2772,9 @@ impl TextBuffer {
                     // #endregion
                     self.edit_begin_grouping();
                     for (beg, end) in ranges.into_iter().rev() {
+                        // Keep one undo entry per slice; grouping then merges all
+                        // of them into a single undo step via shared generation.
+                        self.last_history_type = HistoryType::Other;
                         self.edit_begin(HistoryType::Delete, beg);
                         self.edit_delete(end);
                         self.edit_end();
