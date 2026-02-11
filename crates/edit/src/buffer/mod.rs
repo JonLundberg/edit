@@ -2391,9 +2391,9 @@ impl TextBuffer {
     ///
     /// For every visual line intersected by the rectangle we compute the start‑
     /// and end‑cursor of the slice, then delete the slices *backwards* so that
-    /// earlier deletions do not shift the offsets of later ones.  Each slice is
-    /// recorded as a separate history entry (no `edit_begin_grouping()`), which
-    /// makes undo work correctly.
+    /// earlier deletions do not shift the offsets of later ones. Each slice is
+    /// recorded as a separate history entry, and the whole operation is grouped
+    /// into a single undo step.
     fn delete_rectangular_selection(&mut self) {
         // -----------------------------------------------------------------
         // 1️⃣  We know there *is* a selection and it is rectangular.
@@ -2439,11 +2439,9 @@ impl TextBuffer {
         }
 
         // -----------------------------------------------------------------
-        // 3️⃣  Delete every slice.  **Do NOT** call edit_begin_grouping()**.
-        //     Each iteration creates its own HistoryEntry, so undo will
-        //     restore the slices in reverse order – exactly what we need.
-        //     Reset last_history_type so edit_begin won't merge consecutive
-        //     Deletes into one entry (which would break undo).
+        // 3️⃣  Delete every slice as one grouped undo step.
+        //     Each iteration creates its own HistoryEntry, and grouping makes
+        //     them undo/redo together.
         // -----------------------------------------------------------------
         // #region agent log
         dbg_agent_log(
@@ -2456,12 +2454,14 @@ impl TextBuffer {
             ],
         );
         // #endregion
+        self.edit_begin_grouping();
         for (beg, end) in ranges.into_iter().rev() {
             self.last_history_type = HistoryType::Other;
             self.edit_begin(HistoryType::Delete, beg);
             self.edit_delete(end);
             self.edit_end();
         }
+        self.edit_end_grouping();
 
         // -----------------------------------------------------------------
         // 4️⃣  The rectangular selection is consumed – clear it.
@@ -2979,8 +2979,6 @@ impl TextBuffer {
     fn edit_delete(&mut self, to: Cursor) {
         debug_assert!(to.offset >= self.active_edit_off);
 
-        // Remember the logical line number where the deletion starts.
-        let logical_y_before = self.cursor.logical_pos.y;
         let off = self.active_edit_off;
         let mut out_off = usize::MAX;
 
@@ -3018,29 +3016,21 @@ impl TextBuffer {
         );
         // #endregion
 
+        // Count newline bytes in the to-be-deleted range before mutating the buffer.
+        let mut lines_removed = 0usize;
+        let mut scan_off = off;
+        while scan_off < to.offset {
+            let chunk = self.read_forward(scan_off);
+            let chunk = &chunk[..chunk.len().min(to.offset - scan_off)];
+            lines_removed += chunk.iter().filter(|&&b| b == b'\n').count();
+            scan_off += chunk.len();
+        }
+
         // Delete the portion from the buffer by enlarging the gap.
         let count = to.offset - off;
         self.buffer.allocate_gap(off, 0, count);
 
-        // -----------------------------------------------------------------
-        // Keep `stats.logical_lines` in sync with deletions.
-        //
-        // After removing bytes we may have removed one or more newline
-        // characters. The number of logical lines that disappeared is the
-        // difference between the line number *before* the deletion and the
-        // line number of the same byte offset *after* the buffer has been
-        // modified.
-        //
-        // `cursor_move_to_offset_internal` recomputes the cursor position
-        // using the current (post‑delete) buffer contents, so the logical
-        // Y it returns reflects the new line count at that offset.
-        // -----------------------------------------------------------------
-        let after_cursor = self.cursor_move_to_offset_internal(self.cursor, off);
-        let lines_removed = logical_y_before.saturating_sub(after_cursor.logical_pos.y);
-
         if lines_removed != 0 {
-            // `CoordType` is signed; we use saturating_sub to avoid underflow
-            // in the (theoretically impossible) case of a buggy count.
             self.stats.logical_lines =
                 self.stats.logical_lines.saturating_sub(lines_removed as CoordType);
         }
@@ -3286,4 +3276,108 @@ fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::clipboard::Clipboard;
+
+    fn buffer_text(tb: &mut TextBuffer) -> String {
+        let mut out = String::new();
+        tb.save_as_string(&mut out);
+        out
+    }
+
+    fn seed_text(tb: &mut TextBuffer, text: &str) {
+        tb.buffer.clear();
+        tb.buffer.replace(0..0, text.as_bytes());
+        tb.undo_stack.clear();
+        tb.redo_stack.clear();
+        tb.last_history_type = HistoryType::Other;
+        tb.cursor = Default::default();
+        tb.set_selection(None);
+        tb.stats.logical_lines = text.as_bytes().iter().filter(|&&b| b == b'\n').count() as CoordType + 1;
+        let _ = tb.set_width(120);
+        tb.reflow();
+    }
+
+    #[test]
+    fn rectangular_cut_undo_restores_text_cursor_and_selection() {
+        let mut tb = TextBuffer::new(true).unwrap();
+        seed_text(&mut tb, "abcde\nfghij\nklmno");
+
+        tb.cursor_move_to_logical(Point { x: 3, y: 2 });
+        tb.set_selection(Some(TextBufferSelection {
+            beg: Point { x: 1, y: 0 },
+            end: Point { x: 3, y: 2 },
+            mode: SelectionMode::Rectangular,
+        }));
+
+        let text_before = buffer_text(&mut tb);
+        let cursor_before = tb.cursor_logical_pos();
+        let (sel_beg_before, sel_end_before, sel_mode_before) = tb
+            .selection
+            .as_ref()
+            .map(|s| (s.beg, s.end, s.mode))
+            .expect("rectangular selection is expected before cut");
+
+        let mut clipboard = Clipboard::default();
+        tb.cut(&mut clipboard);
+
+        let expected_clip = if tb.newlines_are_crlf { "bc\r\ngh\r\nlm" } else { "bc\ngh\nlm" };
+        assert_eq!(String::from_utf8_lossy(clipboard.read()), expected_clip);
+        assert_eq!(buffer_text(&mut tb), "ade\nfij\nkno");
+
+        tb.undo();
+
+        assert_eq!(buffer_text(&mut tb), text_before);
+        assert_eq!(tb.cursor_logical_pos(), cursor_before);
+
+        let (sel_beg_after, sel_end_after, sel_mode_after) = tb
+            .selection
+            .as_ref()
+            .map(|s| (s.beg, s.end, s.mode))
+            .expect("selection is expected after undo");
+        assert_eq!(sel_beg_after, sel_beg_before);
+        assert_eq!(sel_end_after, sel_end_before);
+        assert!(sel_mode_after == sel_mode_before);
+        assert!(sel_mode_after == SelectionMode::Rectangular);
+    }
+
+    #[test]
+    fn rectangular_delete_undo_restores_in_single_step() {
+        let mut tb = TextBuffer::new(true).unwrap();
+        seed_text(&mut tb, "abcde\nfghij\nklmno");
+
+        tb.cursor_move_to_logical(Point { x: 3, y: 2 });
+        tb.set_selection(Some(TextBufferSelection {
+            beg: Point { x: 1, y: 0 },
+            end: Point { x: 3, y: 2 },
+            mode: SelectionMode::Rectangular,
+        }));
+
+        let text_before = buffer_text(&mut tb);
+        tb.delete(CursorMovement::Grapheme, 1);
+        assert_eq!(buffer_text(&mut tb), "ade\nfij\nkno");
+
+        tb.undo();
+        assert_eq!(buffer_text(&mut tb), text_before);
+        assert!(tb.selection.is_some());
+        assert!(tb.selection.as_ref().is_some_and(|s| s.mode == SelectionMode::Rectangular));
+    }
+
+    #[test]
+    fn delete_newline_decrements_logical_line_count() {
+        let mut tb = TextBuffer::new(true).unwrap();
+        seed_text(&mut tb, "abc\ndef");
+        assert_eq!(tb.logical_line_count(), 2);
+
+        tb.cursor_move_to_logical(Point { x: 3, y: 0 });
+        tb.delete(CursorMovement::Grapheme, 1);
+
+        assert_eq!(buffer_text(&mut tb), "abcdef");
+        assert_eq!(tb.logical_line_count(), 1);
+    }
 }
